@@ -130,6 +130,8 @@ typedef struct {
 
     // non-null when waiting on a semaphore, requires sleeping=true
     sem_t *waiting_semaphore;
+    // true if we're already in a call, indicates reentrancy
+    bool in_call;
 } ThreadInfo;
 
 static struct {
@@ -307,6 +309,7 @@ static void libidle_register_thread(pthread_t thread)
         .forced_state_ptr = NULL,
         .forced_state_len = 0,
         .waiting_semaphore = NULL,
+        .in_call = false,
     };
     libidle_unlock_state_mutex();
 }
@@ -631,10 +634,21 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
 int pthread_join(pthread_t thread, void **retval)
 {
+    ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
+
     NON_NULL(next_pthread_join);
+    if (thr_info->in_call)
+    {
+        /**
+         * As with libidle_sem_wait, we just forward the call and don't worry about it.
+         */
+        return next_pthread_join(thread, retval);
+    }
     entering_blocked_op("pthread_join()\n");
+    thr_info->in_call = true;
     // TODO wakeup signalling on thread destruction
     int ret = next_pthread_join(thread, retval);
+    thr_info->in_call = false;
     left_blocked_op("pthread_join()\n");
     return ret;
 }
@@ -800,10 +814,10 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     ThreadInfo *thr_info = libidle_find_thr_info(pthread_self());
     assert(thr_info);
 
-    if (thr_info->waiting_semaphore != NULL)
+    if (thr_info->in_call)
     {
         /**
-         * There's already a semaphore wait going on.
+         * There's already a call going on.
          * This means we're being called from a signal handler, like the D GC handler.
          * Signal handlers should not participate in libidle operation, since they
          * are not part of the normal thread behavior.
@@ -818,6 +832,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
     if (!is_named_semaphore)
     {
         thr_info->waiting_semaphore = sem;
+        thr_info->in_call = true;
     }
 
     libidle_unlock_state_mutex();
@@ -880,6 +895,7 @@ static int libidle_sem_wait(bool timedwait, sem_t *sem, const struct timespec *a
         sem_info = libidle_find_sem_info(sem);
 
         thr_info->waiting_semaphore = NULL;
+        thr_info->in_call = false;
         sem_info->pending_wakeups--;
 
         libidle_unlock_state_mutex();
